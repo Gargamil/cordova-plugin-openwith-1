@@ -3,66 +3,146 @@ const path = require('path');
 
 const {
   PLUGIN_ID,
+  iosFolder,
   getPreferences,
   findXCodeproject,
   replacePreferencesInFile,
   log, redError,
 } = require('./utils')
 
-function copyFileSync(source, target, preferences) {
-  var targetFile = target;
+// Return the list of files in the share extension project, organized by type
+const FILE_TYPES = {
+  '.h': 'source',
+  '.m': 'source',
+  '.plist': 'config',
+  '.entitlements': 'config',
+};
 
-  // If target is a directory a new file with the same name will be created
-  if (fs.existsSync(target)) {
-    if (fs.lstatSync(target).isDirectory()) {
-      targetFile = path.join(target, path.basename(source));
-    }
+function parsePbxProject(context, pbxProjectPath) {
+  var xcode = require('xcode');
+  log(`Parsing existing project at location: ${pbxProjectPath}…`);
+
+  var pbxProject;
+
+  if (context.opts.cordova.project) {
+    pbxProject = context.opts.cordova.project.parseProjectFile(context.opts.projectRoot).xcode;
+  } else {
+    pbxProject = xcode.project(pbxProjectPath);
+    pbxProject.parseSync();
   }
 
-  fs.writeFileSync(targetFile, fs.readFileSync(source));
-  replacePreferencesInFile(targetFile, preferences);
+  return pbxProject;
 }
 
-function copyFolderRecursiveSync(source, target, preferences) {
-  var files = [];
+function forEachShareExtensionFile(context, callback) {
+  var shareExtensionFolder = path.join(iosFolder(context), 'ShareExtension');
+  fs.readdirSync(shareExtensionFolder).forEach(function (name) {
+    // Ignore junk files like .DS_Store
+    if (!/^\..*/.test(name)) {
+      callback({
+        name: name,
+        path: path.join(shareExtensionFolder, name),
+        extension: path.extname(name)
+      });
+    }
+  });
+}
 
-  // Check if folder needs to be created or integrated
-  var targetFolder = path.join(target, path.basename(source));
-  if (!fs.existsSync(targetFolder)) {
-    fs.mkdirSync(targetFolder);
-  }
+function getShareExtensionFiles(context) {
+  var files = {source: [], config: [], resource: []};
 
-  // Copy
-  if (fs.lstatSync(source).isDirectory()) {
-    files = fs.readdirSync(source);
-    files.forEach(function (file) {
-      var curSource = path.join(source, file);
-      if (fs.lstatSync(curSource).isDirectory()) {
-        copyFolderRecursiveSync(curSource, targetFolder, preferences);
-      } else {
-        copyFileSync(curSource, targetFolder, preferences);
-      }
-    });
-  }
+  forEachShareExtensionFile(context, function (file) {
+    var fileType = FILE_TYPES[file.extension] || 'resource';
+    files[fileType].push(file);
+  });
+
+  return files;
 }
 
 module.exports = function (context) {
-  log('Copying ShareExtension files to iOS project')
+  log('Adding ShareExt target to XCode project')
 
   var Q = require('q');
   var deferral = new Q.defer();
 
+
   findXCodeproject(context, function (projectFolder, projectName) {
     var preferences = getPreferences(context, projectName);
 
-    var srcFolder = path.join(context.opts.projectRoot, 'plugins', PLUGIN_ID, 'src', 'ios', 'ShareExtension');
-    var targetFolder = path.join(context.opts.projectRoot, 'platforms', 'ios');
+    var pbxProjectPath = path.join(projectFolder, 'project.pbxproj');
+    var pbxProject = parsePbxProject(context, pbxProjectPath);
 
-    if (!fs.existsSync(srcFolder)) {
-      throw redError('Missing extension project folder in ' + srcFolder + '.');
+    var files = getShareExtensionFiles(context);
+    files.config.concat(files.source).forEach(function (file) {
+      replacePreferencesInFile(file.path, preferences);
+    });
+
+    // Find if the project already contains the target and group
+    var target = pbxProject.pbxTargetByName('ShareExt');
+    if (target) {
+      log('ShareExt target already exists')
     }
 
-    copyFolderRecursiveSync(srcFolder, targetFolder, preferences);
+    if (!target) {
+      // Add PBXNativeTarget to the project
+      target = pbxProject.addTarget('ShareExt', 'app_extension', 'ShareExtension');
+
+      // Add a new PBXSourcesBuildPhase for our ShareViewController
+      // (we can't add it to the existing one because an extension is kind of an extra app)
+      pbxProject.addBuildPhase([], 'PBXSourcesBuildPhase', 'Sources', target.uuid);
+
+      // Add a new PBXResourcesBuildPhase for the Resources used by the Share Extension
+      // (MainInterface.storyboard)
+      pbxProject.addBuildPhase([], 'PBXResourcesBuildPhase', 'Resources', target.uuid);
+    }
+
+    // Create a separate PBXGroup for the shareExtensions files, name has to be unique and path must be in quotation marks
+    var pbxGroupKey = pbxProject.findPBXGroupKey({name: 'ShareExtension'});
+    if (pbxProject) {
+      log('ShareExtension group already exists')
+    }
+
+    if (!pbxGroupKey) {
+      pbxGroupKey = pbxProject.pbxCreateGroup('ShareExtension', 'ShareExtension');
+
+      // Add the PbxGroup to cordovas "CustomTemplate"-group
+      var customTemplateKey = pbxProject.findPBXGroupKey({name: 'CustomTemplate'});
+      pbxProject.addToPbxGroup(pbxGroupKey, customTemplateKey);
+    }
+
+    // Add files which are not part of any build phase (config)
+    files.config.forEach(function (file) {
+      pbxProject.addFile(file.name, pbxGroupKey);
+    });
+
+    // Add source files to our PbxGroup and our newly created PBXSourcesBuildPhase
+    files.source.forEach(function (file) {
+      pbxProject.addSourceFile(file.name, {target: target.uuid}, pbxGroupKey);
+    });
+
+    //  Add the resource file and include it into the targest PbxResourcesBuildPhase and PbxGroup
+    files.resource.forEach(function (file) {
+      pbxProject.addResourceFile(file.name, {target: target.uuid}, pbxGroupKey);
+    });
+
+    // Add build settings for Swift support, bridging header and xcconfig files
+    var configurations = pbxProject.pbxXCBuildConfigurationSection();
+    for (var key in configurations) {
+      if (typeof configurations[key].buildSettings !== 'undefined') {
+        var buildSettingsObj = configurations[key].buildSettings;
+        if (typeof buildSettingsObj['PRODUCT_NAME'] !== 'undefined') {
+          var productName = buildSettingsObj['PRODUCT_NAME'];
+          if (productName.indexOf('ShareExt') >= 0) {
+            buildSettingsObj['CODE_SIGN_ENTITLEMENTS'] = '"ShareExtension/ShareExtension.entitlements"';
+          }
+        }
+      }
+    }
+
+    // Write the modified project back to disc
+    fs.writeFileSync(pbxProjectPath, pbxProject.writeSync());
+    log('Successfully added ShareExt target to XCode project')
+
     deferral.resolve();
   });
 
