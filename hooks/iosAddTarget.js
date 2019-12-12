@@ -129,6 +129,10 @@ module.exports = function(context) {
           var productName = buildSettingsObj['PRODUCT_NAME'];
           if (productName.indexOf('ShareExt') >= 0) {
             buildSettingsObj['CODE_SIGN_ENTITLEMENTS'] = '"ShareExtension/ShareExtension.entitlements"';
+            const bundleIdentifier = preferences.find(el => el.key === '__BUNDLE_IDENTIFIER__');
+            if (bundleIdentifier) {
+              buildSettingsObj['PRODUCT_BUNDLE_IDENTIFIER'] = bundleIdentifier.value;
+            }
           }
         }
       }
